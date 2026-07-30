@@ -47,7 +47,9 @@ class HarborAgent(BaseAgent):
         req = urllib.request.Request(
             base + "/chat/completions", data=body,
             headers={"Authorization": "Bearer " + self._env("HARNESS_LLM_KEY"),
-                     "Content-Type": "application/json"})
+                     "Content-Type": "application/json",
+                     # urllib's default User-Agent gets 403'd by the API's CDN
+                     "User-Agent": "harness-agent/1.0"})
         for attempt in range(5):  # 429/5xx backoff — rate limits must not kill the trial
             try:
                 with urllib.request.urlopen(req, timeout=120) as r:
