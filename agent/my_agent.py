@@ -11,6 +11,7 @@ OpenAI-compatible provider works and no key ever lives in this repo.
 
 Things worth tuning, in rough order of impact:
   build_user_prompt   what the model is told about the game — the real lever
+  pretty_print_3d     how a frame is encoded; this dominates token cost
   DO_OBSERVATION      True = a reasoning call before each action (2x the calls)
   MESSAGE_LIMIT       how much history the model still sees
   MAX_ACTIONS         per-game action budget (the runner caps this too)
@@ -19,10 +20,13 @@ from __future__ import annotations
 
 import os
 import textwrap
+from typing import Any
 
 from arcengine import FrameData
 
 from agents.templates.llm_agents import LLM
+
+HEX = "0123456789abcdef"
 
 
 class MyAgent(LLM):
@@ -34,7 +38,22 @@ class MyAgent(LLM):
     # wall clock and the rate-limit pressure across 25 games. Flip it back on if
     # your model reasons better when it narrates first.
     DO_OBSERVATION = False
-    MESSAGE_LIMIT = 12
+    MESSAGE_LIMIT = 6
+
+    def pretty_print_3d(self, array_3d: list[list[list[Any]]]) -> str:
+        """One hex char per cell instead of a Python list repr.
+
+        The framework prints every row as `[0, 0, 10, ...]`, which costs roughly
+        10k tokens for a 64x64 grid — the brackets, commas and spaces outweigh the
+        data. Cell values are INT<0,15>, so a single hex digit is lossless and cuts
+        a frame to about 1.5k tokens. Only the final grid is sent: it is the
+        current state, and history already lives in the message window.
+        """
+        if not array_3d:
+            return "(empty)"
+        rows = ["".join(HEX[int(v) & 15] for v in row) for row in array_3d[-1]]
+        return ("Grid, one hex char per cell, row 0 first, column 0 leftmost:\n"
+                + "\n".join(rows))
 
     def build_user_prompt(self, latest_frame: FrameData) -> str:
         return textwrap.dedent(
