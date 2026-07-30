@@ -79,6 +79,14 @@ class MyAgent(LLM):
                 logger.warning(f"provider unavailable ({type(e).__name__}), "
                                f"retry {attempt + 1}/{self.RATE_LIMIT_TRIES} in {wait}s")
                 time.sleep(wait)
+            except openai.BadRequestError as e:
+                # FIFO trimming can cut between an assistant tool_calls message and its
+                # tool response, which the API rejects outright. The template's guard
+                # only strips leading tool messages and doesn't catch every case, so
+                # drop the history and let the next call rebuild it — losing context
+                # beats losing the remaining games.
+                logger.warning(f"history rejected ({str(e)[:120]}) — resetting messages")
+                self.messages = []
         legal = latest_frame.available_actions or [1, 2, 3, 4, 5, 6]
         action = GameAction.from_name(f"ACTION{random.choice(legal)}")
         if action.is_complex():
