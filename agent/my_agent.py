@@ -1,101 +1,67 @@
-"""ARC-AGI-3 agent for the Exposure Academy Agentic Harness (reference example).
+"""ARC-AGI-3 agent — a thin subclass of the framework's own LLM agent.
 
-Runs inside the ARC-AGI-3-Agents framework (the harness overlays this file onto
-the official Kaggle starter and drives it with scripts/play_local.py). Encodes
-the current frame as a small text grid, asks an OpenAI-compatible LLM for the
-next action, falls back to a random legal action on any error.
+`agents.templates.llm_agents.LLM` ships inside ARC-AGI-3-Agents (vendored by the
+starter kit). It already handles the whole loop: chat history with a rolling
+window, the RESET bootstrap, one OpenAI tool per game action, coordinate parsing
+for ACTION6, and token accounting. We inherit it and only supply strategy.
 
-Env (injected by the harness):
-  HARNESS_LLM_BASE / HARNESS_LLM_KEY / HARNESS_LLM_MODEL
+The LLM endpoint comes from OPENAI_BASE_URL / OPENAI_API_KEY, which the runner
+injects — the OpenAI SDK reads both from the environment, so any
+OpenAI-compatible provider works and no key ever lives in this repo.
+
+Things worth tuning, in rough order of impact:
+  build_user_prompt   what the model is told about the game — the real lever
+  DO_OBSERVATION      True = a reasoning call before each action (2x the calls)
+  MESSAGE_LIMIT       how much history the model still sees
+  MAX_ACTIONS         per-game action budget (the runner caps this too)
 """
 from __future__ import annotations
 
 import os
-import random
-import re
-from typing import Any
+import textwrap
 
-import requests
+from arcengine import FrameData
 
-from arcengine import FrameData, GameAction, GameState
-from agents.agent import Agent
-
-SYSTEM = (
-    "You control an agent in a 2D puzzle game shown as a grid of digits. "
-    "Reply with exactly one action token: ACTION1, ACTION2, ACTION3, ACTION4, "
-    "ACTION5, or ACTION6 x y (coordinates 0-63). Nothing else."
-)
+from agents.templates.llm_agents import LLM
 
 
-def encode_grid(frame: list[list[list[int]]]) -> str:
-    """Downsample the 64x64 top layer to 16x16 so the prompt stays tiny."""
-    if not frame:
-        return "(empty)"
-    g = frame[-1]
-    rows = []
-    for y in range(0, len(g), 4):
-        rows.append("".join(str(g[y][x] % 10) for x in range(0, len(g[y]), 4)))
-    return "\n".join(rows)
+class MyAgent(LLM):
+    MAX_ACTIONS = 200
+    MODEL = os.environ.get("HARNESS_LLM_MODEL", "gemma-4-31b")
+    # gemma answers with tool_calls, not the legacy function_call field.
+    MODEL_REQUIRES_TOOLS = True
+    # One call per action instead of two: an observation pass doubles both the
+    # wall clock and the rate-limit pressure across 25 games. Flip it back on if
+    # your model reasons better when it narrates first.
+    DO_OBSERVATION = False
+    MESSAGE_LIMIT = 12
 
+    def build_user_prompt(self, latest_frame: FrameData) -> str:
+        return textwrap.dedent(
+            f"""
+# CONTEXT:
+You are playing an unfamiliar 2D puzzle game. You must discover the rules by
+experimenting. Your objective is to complete levels (raise levels_completed)
+and reach WIN, using as few actions as possible, without hitting GAME_OVER.
 
-class MyAgent(Agent):
-    """Asks the LLM each step; random fallback keeps the run alive on errors."""
+The screen is a grid of integers. Each cell is INT<0,15>: the value is a colour
+id, and shapes of equal value are the same object. Coordinates are
+INT<0,63> for both x and y, with (0,0) at the top-left.
 
-    MAX_ACTIONS = 40
+# WHAT YOU KNOW SO FAR:
+state={latest_frame.state.name} levels_completed={latest_frame.levels_completed}
+available actions this turn: {latest_frame.available_actions}
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
-        self.base = os.environ.get("HARNESS_LLM_BASE", "https://api.cerebras.ai/v1").rstrip("/")
-        self.key = os.environ.get("HARNESS_LLM_KEY", "")
-        self.model = os.environ.get("HARNESS_LLM_MODEL", "gemma-4-31b")
+# STRATEGY:
+- Early on, prefer unused simple actions to learn what each one changes.
+- Compare the last grid to the current one: the cells that changed reveal
+  which object you control and what the action did.
+- If an action changed nothing twice, stop repeating it and try another.
+- ACTION6 clicks a specific cell — use it to interact with an object you have
+  already located, not to explore blindly.
+- If the state is GAME_OVER, call RESET and avoid whatever preceded the loss.
 
-    def is_done(self, frames: list[FrameData], latest_frame: FrameData) -> bool:
-        return latest_frame.state is GameState.WIN
-
-    def ask_llm(self, latest_frame: FrameData) -> str:
-        legal = latest_frame.available_actions or [1, 2, 3, 4, 5, 6]
-        prompt = (
-            f"Legal actions: {', '.join('ACTION%d' % a for a in legal)}\n"
-            f"Levels completed: {latest_frame.levels_completed}\n"
-            f"Grid (16x16 downsample):\n{encode_grid(latest_frame.frame)}\n"
-            "Next action?"
-        )
-        r = requests.post(
-            f"{self.base}/chat/completions",
-            headers={"Authorization": f"Bearer {self.key}"},
-            json={
-                "model": self.model,
-                "messages": [{"role": "system", "content": SYSTEM},
-                             {"role": "user", "content": prompt}],
-                "temperature": 0.3,
-                "max_tokens": 16,
-            },
-            timeout=30,
-        )
-        r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"]
-
-    def choose_action(
-        self, frames: list[FrameData], latest_frame: FrameData
-    ) -> GameAction:
-        if latest_frame.state in (GameState.NOT_PLAYED, GameState.GAME_OVER):
-            return GameAction.RESET
-
-        legal = latest_frame.available_actions or [1, 2, 3, 4, 5, 6]
-        try:
-            reply = self.ask_llm(latest_frame)
-            m = re.search(r"ACTION([1-6])(?:\D+(\d{1,2})\D+(\d{1,2}))?", reply)
-            n = int(m.group(1)) if m and int(m.group(1)) in legal else random.choice(legal)
-            action = GameAction.from_name(f"ACTION{n}")
-            if action.is_complex():
-                x = min(int(m.group(2)), 63) if m and m.group(2) else random.randint(0, 63)
-                y = min(int(m.group(3)), 63) if m and m.group(3) else random.randint(0, 63)
-                action.set_data({"x": x, "y": y})
-            action.reasoning = {"llm": reply[:120]}
-        except Exception as e:  # LLM down/rate-limited → keep playing randomly
-            n = random.choice(legal)
-            action = GameAction.from_name(f"ACTION{n}")
-            if action.is_complex():
-                action.set_data({"x": random.randint(0, 63), "y": random.randint(0, 63)})
-            action.reasoning = {"fallback": str(e)[:120]}
-        return action
+# TURN:
+Call exactly one action.
+        """
+        ).strip()

@@ -1,91 +1,41 @@
-"""Frontier-bench (Harbor) agent for the Exposure Academy Agentic Harness.
+"""Frontier-bench agent — a thin subclass of Harbor's Terminus 2.
 
-Runs on the host inside Harbor's own Python — standard library ONLY
-(requirements.txt is NOT installed for this file). Solves a task by asking an
-OpenAI-compatible LLM for shell commands and executing them in the task
-container via environment.exec(), Terminus-style, up to MAX_STEPS.
+Terminus 2 is the reference terminal agent that ships inside Harbor: a tmux
+session in the task container, a JSON tool-call protocol, context
+summarization, and trajectory recording. Roughly 80KB of scaffolding that has
+been tuned against Terminal-Bench. Rather than hand-roll a command loop, we
+inherit all of it and only change the knobs.
 
-Env (injected by the harness via --ae): HARNESS_LLM_BASE / KEY / MODEL.
+The model comes from Harbor's `-m/--model` flag (a LiteLLM model string such as
+`cerebras/gemma-4-31b`), so credentials stay in the runner's environment and
+never in this repo.
+
+Things worth tuning, in rough order of impact:
+  max_turns                 how many commands the agent may run per task
+  parser_name               "json" (default) or "xml" response protocol
+  enable_summarize          keep long trajectories inside the context window
+  temperature               0 is usually right for shell work
 """
 from __future__ import annotations
 
-import json
-import os
-import time
-import urllib.request
+from typing import Any
 
-from harbor.agents.base import BaseAgent
-
-MAX_STEPS = 20
-SYSTEM = (
-    "You are an autonomous agent solving a task in a Linux container. "
-    "Reply ONLY with a JSON object: {\"cmd\": \"<shell command>\"} to run a "
-    "command, or {\"done\": true} when the task is complete. One command at a "
-    "time; non-interactive commands only."
-)
+from harbor.agents.terminus_2 import Terminus2
 
 
-class HarborAgent(BaseAgent):
+class HarborAgent(Terminus2):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        # setdefault, never hard-code: the runner (or `--ak key=value`) must still win.
+        kwargs.setdefault("max_turns", 40)
+        kwargs.setdefault("temperature", 0.0)
+        # asciinema recording needs extra binaries in every task image and buys us
+        # nothing on a student leaderboard.
+        kwargs.setdefault("record_terminal_session", False)
+        super().__init__(*args, **kwargs)
+
     @staticmethod
     def name() -> str:
-        return "exposure-mockup"
+        return "exposure-terminus-2"
 
     def version(self) -> str:
-        return "2.0"
-
-    def _env(self, key: str, default: str = "") -> str:
-        return self.extra_env.get(key) or os.environ.get(key, default)
-
-    def _llm(self, messages: list[dict]) -> str:
-        base = self._env("HARNESS_LLM_BASE", "https://api.cerebras.ai/v1").rstrip("/")
-        body = json.dumps({
-            "model": self._env("HARNESS_LLM_MODEL", "gemma-4-31b"),
-            "messages": messages,
-            "temperature": 0,
-            "max_tokens": 300,
-        }).encode()
-        req = urllib.request.Request(
-            base + "/chat/completions", data=body,
-            headers={"Authorization": "Bearer " + self._env("HARNESS_LLM_KEY"),
-                     "Content-Type": "application/json",
-                     # urllib's default User-Agent gets 403'd by the API's CDN
-                     "User-Agent": "harness-agent/1.0"})
-        for attempt in range(5):  # 429/5xx backoff — rate limits must not kill the trial
-            try:
-                with urllib.request.urlopen(req, timeout=120) as r:
-                    return json.load(r)["choices"][0]["message"]["content"]
-            except Exception:
-                if attempt == 4:
-                    raise
-                time.sleep(2 ** attempt)
-        return ""
-
-    async def setup(self, environment) -> None:
-        pass
-
-    async def run(self, instruction, environment, context) -> None:
-        messages = [{"role": "system", "content": SYSTEM},
-                    {"role": "user", "content": "Task:\n" + instruction}]
-        steps = 0
-        for _ in range(MAX_STEPS):
-            reply = self._llm(messages)
-            messages.append({"role": "assistant", "content": reply})
-            try:
-                start = reply.index("{")
-                cmd = json.loads(reply[start:reply.rindex("}") + 1])
-            except ValueError:
-                messages.append({"role": "user", "content": "Reply with JSON only."})
-                continue
-            if cmd.get("done"):
-                break
-            if not cmd.get("cmd"):
-                messages.append({"role": "user", "content": "Missing 'cmd'."})
-                continue
-            steps += 1
-            try:
-                res = await environment.exec(cmd["cmd"], timeout_sec=180)
-                out = f"exit={res.return_code}\nstdout:\n{(res.stdout or '')[-2000:]}\nstderr:\n{(res.stderr or '')[-1000:]}"
-            except Exception as e:
-                out = f"exec error: {e}"
-            messages.append({"role": "user", "content": out})
-        context.metadata = {"steps": steps}
+        return "3.0"
