@@ -18,13 +18,19 @@ Things worth tuning, in rough order of impact:
 """
 from __future__ import annotations
 
+import logging
 import os
+import random
 import textwrap
+import time
 from typing import Any
 
-from arcengine import FrameData
+import openai
+from arcengine import FrameData, GameAction
 
 from agents.templates.llm_agents import LLM
+
+logger = logging.getLogger(__name__)
 
 HEX = "0123456789abcdef"
 
@@ -54,6 +60,31 @@ class MyAgent(LLM):
         rows = ["".join(HEX[int(v) & 15] for v in row) for row in array_3d[-1]]
         return ("Grid, one hex char per cell, row 0 first, column 0 leftmost:\n"
                 + "\n".join(rows))
+
+    # The template builds its own OpenAI client per call with max_retries=2, so a
+    # provider that is merely busy (429 queue_exceeded) ends the whole game. A run is
+    # thousands of calls long — absorb throttling here or lose hours of play to one
+    # bad minute. Acting blind beats dying: a random legal action keeps the game alive.
+    RATE_LIMIT_TRIES = 6
+
+    def choose_action(
+        self, frames: list[FrameData], latest_frame: FrameData
+    ) -> GameAction:
+        for attempt in range(self.RATE_LIMIT_TRIES):
+            try:
+                return super().choose_action(frames, latest_frame)
+            except (openai.RateLimitError, openai.APIConnectionError,
+                    openai.InternalServerError) as e:
+                wait = min(2 ** attempt, 30)
+                logger.warning(f"provider unavailable ({type(e).__name__}), "
+                               f"retry {attempt + 1}/{self.RATE_LIMIT_TRIES} in {wait}s")
+                time.sleep(wait)
+        legal = latest_frame.available_actions or [1, 2, 3, 4, 5, 6]
+        action = GameAction.from_name(f"ACTION{random.choice(legal)}")
+        if action.is_complex():
+            action.set_data({"x": random.randint(0, 63), "y": random.randint(0, 63)})
+        action.reasoning = {"fallback": "provider throttled, acting blind"}
+        return action
 
     def build_user_prompt(self, latest_frame: FrameData) -> str:
         return textwrap.dedent(
