@@ -1,87 +1,101 @@
-"""Mockup agent for the Exposure Academy Agentic Harness.
+"""ARC-AGI-3 agent for the Exposure Academy Agentic Harness (reference example).
 
-Solves two small built-in puzzle sets by asking an OpenAI-compatible LLM
-endpoint (Cerebras/SambaNova/anything). No tools, no memory — the simplest
-thing that exercises the whole submission pipeline for real.
+Runs inside the ARC-AGI-3-Agents framework (the harness overlays this file onto
+the official Kaggle starter and drives it with scripts/play_local.py). Encodes
+the current frame as a small text grid, asks an OpenAI-compatible LLM for the
+next action, falls back to a random legal action on any error.
 
-Env:
-  HARNESS_LLM_BASE   default https://api.cerebras.ai/v1
-  HARNESS_LLM_KEY    required
-  HARNESS_LLM_MODEL  default gemma-4-31b-it
-  HARNESS_SET        arc | frontier | all (default all)
-  HARNESS_LIMIT      optional int, cap puzzles per set (RAM probe uses 2)
-
-Prints one JSON object to stdout: {"score_arc": float|null, "score_frontier": float|null}
-Progress goes to stderr.
+Env (injected by the harness):
+  HARNESS_LLM_BASE / HARNESS_LLM_KEY / HARNESS_LLM_MODEL
 """
+from __future__ import annotations
 
-import json
 import os
-import sys
+import random
+import re
+from typing import Any
 
 import requests
 
-ARC_PUZZLES = [
-    ("Continue the sequence: 2, 6, 18, 54. Answer with the next number only.", "162"),
-    ("Reverse the string ABCD. Answer with the reversed string only.", "DCBA"),
-    ("Continue the sequence: 1, 4, 9, 16, 25. Answer with the next number only.", "36"),
-    ("If BLUE maps to EULB, what does GREEN map to? Answer with the mapped word only.", "NEERG"),
-    ("Continue the sequence: 1, 1, 2, 3, 5, 8. Answer with the next number only.", "13"),
-    ("Which is the odd one out: 3, 5, 9, 7, 11? Answer with the number only.", "9"),
-]
+from arcengine import FrameData, GameAction, GameState
+from agents.agent import Agent
 
-FRONTIER_PUZZLES = [
-    ("Which bash flag makes ls include hidden files? Answer with the flag only.", "-a"),
-    ("What exit code does a successful unix command return? Answer with the number only.", "0"),
-    ("What octal chmod value gives rwxr-xr-x? Answer with the number only.", "755"),
-    ("Which git subcommand shows the working tree status? Answer with the subcommand only.", "status"),
-    ("Which HTTP status code means Not Found? Answer with the number only.", "404"),
-    ("In Python, what does len('hello') return? Answer with the number only.", "5"),
-]
+SYSTEM = (
+    "You control an agent in a 2D puzzle game shown as a grid of digits. "
+    "Reply with exactly one action token: ACTION1, ACTION2, ACTION3, ACTION4, "
+    "ACTION5, or ACTION6 x y (coordinates 0-63). Nothing else."
+)
 
 
-class MyAgent:
-    def __init__(self):
+def encode_grid(frame: list[list[list[int]]]) -> str:
+    """Downsample the 64x64 top layer to 16x16 so the prompt stays tiny."""
+    if not frame:
+        return "(empty)"
+    g = frame[-1]
+    rows = []
+    for y in range(0, len(g), 4):
+        rows.append("".join(str(g[y][x] % 10) for x in range(0, len(g[y]), 4)))
+    return "\n".join(rows)
+
+
+class MyAgent(Agent):
+    """Asks the LLM each step; random fallback keeps the run alive on errors."""
+
+    MAX_ACTIONS = 40
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
         self.base = os.environ.get("HARNESS_LLM_BASE", "https://api.cerebras.ai/v1").rstrip("/")
-        self.key = os.environ["HARNESS_LLM_KEY"]
-        self.model = os.environ.get("HARNESS_LLM_MODEL", "gemma-4-31b-it")
+        self.key = os.environ.get("HARNESS_LLM_KEY", "")
+        self.model = os.environ.get("HARNESS_LLM_MODEL", "gemma-4-31b")
 
-    def ask(self, question):
+    def is_done(self, frames: list[FrameData], latest_frame: FrameData) -> bool:
+        return latest_frame.state is GameState.WIN
+
+    def ask_llm(self, latest_frame: FrameData) -> str:
+        legal = latest_frame.available_actions or [1, 2, 3, 4, 5, 6]
+        prompt = (
+            f"Legal actions: {', '.join('ACTION%d' % a for a in legal)}\n"
+            f"Levels completed: {latest_frame.levels_completed}\n"
+            f"Grid (16x16 downsample):\n{encode_grid(latest_frame.frame)}\n"
+            "Next action?"
+        )
         r = requests.post(
             f"{self.base}/chat/completions",
             headers={"Authorization": f"Bearer {self.key}"},
             json={
                 "model": self.model,
-                "messages": [{"role": "user", "content": question}],
-                "temperature": 0,
-                "max_tokens": 32,
+                "messages": [{"role": "system", "content": SYSTEM},
+                             {"role": "user", "content": prompt}],
+                "temperature": 0.3,
+                "max_tokens": 16,
             },
-            timeout=60,
+            timeout=30,
         )
         r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"].strip()
+        return r.json()["choices"][0]["message"]["content"]
 
-    def solve_set(self, name, puzzles):
-        limit = int(os.environ.get("HARNESS_LIMIT", "0")) or len(puzzles)
-        puzzles = puzzles[:limit]
-        correct = 0
-        for i, (q, expected) in enumerate(puzzles, 1):
-            try:
-                answer = self.ask(q)
-            except Exception as e:
-                print(f"[{name} {i}/{len(puzzles)}] ERROR {e}", file=sys.stderr)
-                continue
-            ok = expected.lower() in answer.lower()
-            correct += ok
-            print(f"[{name} {i}/{len(puzzles)}] {'ok' if ok else 'MISS'} expected={expected!r} got={answer!r}",
-                  file=sys.stderr)
-        return round(100.0 * correct / len(puzzles), 1)
+    def choose_action(
+        self, frames: list[FrameData], latest_frame: FrameData
+    ) -> GameAction:
+        if latest_frame.state in (GameState.NOT_PLAYED, GameState.GAME_OVER):
+            return GameAction.RESET
 
-    def run(self):
-        which = os.environ.get("HARNESS_SET", "all")
-        result = {"score_arc": None, "score_frontier": None}
-        if which in ("arc", "all"):
-            result["score_arc"] = self.solve_set("arc", ARC_PUZZLES)
-        if which in ("frontier", "all"):
-            result["score_frontier"] = self.solve_set("frontier", FRONTIER_PUZZLES)
-        print(json.dumps(result))
+        legal = latest_frame.available_actions or [1, 2, 3, 4, 5, 6]
+        try:
+            reply = self.ask_llm(latest_frame)
+            m = re.search(r"ACTION([1-6])(?:\D+(\d{1,2})\D+(\d{1,2}))?", reply)
+            n = int(m.group(1)) if m and int(m.group(1)) in legal else random.choice(legal)
+            action = GameAction.from_name(f"ACTION{n}")
+            if action.is_complex():
+                x = min(int(m.group(2)), 63) if m and m.group(2) else random.randint(0, 63)
+                y = min(int(m.group(3)), 63) if m and m.group(3) else random.randint(0, 63)
+                action.set_data({"x": x, "y": y})
+            action.reasoning = {"llm": reply[:120]}
+        except Exception as e:  # LLM down/rate-limited → keep playing randomly
+            n = random.choice(legal)
+            action = GameAction.from_name(f"ACTION{n}")
+            if action.is_complex():
+                action.set_data({"x": random.randint(0, 63), "y": random.randint(0, 63)})
+            action.reasoning = {"fallback": str(e)[:120]}
+        return action
